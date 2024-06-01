@@ -14,13 +14,14 @@ import png
 # CWDH = Character Widths
 # CMAP = Character Mapping
 
-VERSIONS = (0x04000000, 0x03000000)
+VERSIONS = (0x04010000, 0x04000000, 0x03000000)
 
 FFNT_HEADER_SIZE = 0x14
 FINF_HEADER_SIZE = 0x20
 TGLP_HEADER_SIZE = 0x20
 CWDH_HEADER_SIZE = 0x10
-CMAP_HEADER_SIZE = 0x14
+CMAP1_HEADER_SIZE = 0x14
+CMAP2_HEADER_SIZE = 0x18
 
 FFNT_HEADER_MAGIC = (b'FFNT', b'FFNU')
 FINF_HEADER_MAGIC = b'FINF'
@@ -32,7 +33,8 @@ FFNT_HEADER_STRUCT = '%s4s2H3I'
 FINF_HEADER_STRUCT = '%s4sI4B2H4B3I'
 TGLP_HEADER_STRUCT = '%s4sI4BI6HI'
 CWDH_HEADER_STRUCT = '%s4sI2HI'
-CMAP_HEADER_STRUCT = '%s4sI4HI'
+CMAP1_HEADER_STRUCT = '%s4sI4HI'
+CMAP2_HEADER_STRUCT = '%s4s5I'
 
 FORMAT_RGBA8 = 0x00
 FORMAT_RGB8 = 0x01
@@ -123,8 +125,8 @@ MAPPING_METHODS = {
     MAPPING_SCAN: 'Scan'
 }
 
-TGLP_DATA_OFFSET = 0x2000
-
+TGLP1_DATA_OFFSET = 0x2000
+TGLP2_DATA_OFFSET = 0x1000
 
 class Bffnt:
     order = None
@@ -135,6 +137,12 @@ class Bffnt:
     tglp = {}
     cwdh_sections = []
     cmap_sections = []
+    raw_png = False
+    int_size = 2
+    off_by_one = 0
+    CMAP_HEADER_SIZE = CMAP1_HEADER_SIZE
+    CMAP_HEADER_STRUCT = CMAP1_HEADER_STRUCT
+    TGLP_DATA_OFFSET = TGLP1_DATA_OFFSET
 
     def __init__(self, verbose=False, debug=False, load_order='<'):
         self.verbose = verbose
@@ -150,6 +158,8 @@ class Bffnt:
         position = FFNT_HEADER_SIZE
         if self.invalid:
             return
+
+        self._adjust_version()
 
         self._parse_finf(data[position:position + FINF_HEADER_SIZE])
         if self.invalid:
@@ -177,13 +187,13 @@ class Bffnt:
         cmap = self.cmap_offset
         while cmap > 0:
             position = cmap - 8
-            cmap = self._parse_cmap_header(data[position:position + CMAP_HEADER_SIZE])
+            cmap = self._parse_cmap_header(data[position:position + self.CMAP_HEADER_SIZE])
             if self.invalid:
                 return
 
-            position += CMAP_HEADER_SIZE
+            position += self.CMAP_HEADER_SIZE
             info = self.cmap_sections[-1]
-            self._parse_cmap_data(info, data[position:position + info['size'] - CMAP_HEADER_SIZE])
+            self._parse_cmap_data(info, data[position:position + info['size'] - self.CMAP_HEADER_SIZE])
 
         # convert pixels to RGBA8
         self._parse_tglp_data(data)
@@ -194,6 +204,8 @@ class Bffnt:
         self.order = self.load_order
         self.version = json_data['version']
         self.filetype = json_data['fileType']
+
+        self._adjust_version()
 
         self.font_info = json_data['fontInfo']
         tex_info = json_data['textureInfo']
@@ -277,7 +289,7 @@ class Bffnt:
 
         glyph_widths = {}
         for cwdh in self.cwdh_sections:
-            for index in range(cwdh['start'], cwdh['end'] + 1):
+            for index in range(cwdh['start'], cwdh['end'] + 1 - self.off_by_one):
                 glyph_widths[index] = cwdh['data'][index - cwdh['start']]
 
         glyph_mapping = {}
@@ -289,7 +301,7 @@ class Bffnt:
                     except:
                         glyph_mapping[chr(code)] = code - cmap['start'] + cmap['indexOffset']
             elif cmap['type'] == MAPPING_TABLE:
-                for code in range(cmap['start'], cmap['end'] + 1):
+                for code in range(cmap['start'], cmap['end'] + 1 - self.off_by_one * 2):
                     index = cmap['indexTable'][code - cmap['start']]
                     if index != 0xFFFF:
                         try:  #Python2
@@ -327,19 +339,25 @@ class Bffnt:
             sheet = self.tglp['sheets'][i]
             width = sheet['width']
             height = sheet['height']
-            png_data = []
-            for y in range(height):
-                row = []
-                for x in range(width):
-                    for color in sheet['data'][x + (y * width)]:
-                        row.append(color)
 
-                png_data.append(row)
+            if self.raw_png:
+                file_ = open('%s_sheet%d.raw' % (basename_, i), 'wb')
+                file_.write(sheet['data'])
+                file_.close()
+            else:
+                png_data = []
+                for y in range(height):
+                    row = []
+                    for x in range(width):
+                        for color in sheet['data'][x + (y * width)]:
+                            row.append(color)
 
-            file_ = open('%s_sheet%d.png' % (basename_, i), 'wb')
-            writer = png.Writer(width, height, alpha=True)
-            writer.write(file_, png_data)
-            file_.close()
+                    png_data.append(row)
+
+                file_ = open('%s_sheet%d.png' % (basename_, i), 'wb')
+                writer = png.Writer(width, height, alpha=True, greyscale=False)
+                writer.write(file_, png_data)
+                file_.close()
         print('Done')
 
     def save(self, filename):
@@ -373,10 +391,24 @@ class Bffnt:
         finf_tglp_offset_pos = position + 0x14
         finf_cwdh_offset_pos = position + 0x18
         finf_cmap_offset_pos = position + 0x1C
-        data = struct.pack(FINF_HEADER_STRUCT % self.order, FINF_HEADER_MAGIC, FINF_HEADER_SIZE, font_info['fontType'],
-                           font_info['height'], font_info['width'], font_info['ascent'], font_info['lineFeed'],
-                           font_info['alterCharIdx'], default_width['left'], default_width['glyphWidth'],
-                           default_width['charWidth'], font_info['encoding'], 0, 0, 0)
+        data = struct.pack(
+            FINF_HEADER_STRUCT % self.order,
+            FINF_HEADER_MAGIC,
+            FINF_HEADER_SIZE,
+            font_info['fontType'],
+            font_info['height'],
+            font_info['width'],
+            font_info['ascent'],
+            font_info['lineFeed'],
+            font_info['alterCharIdx'],
+            default_width['left'],
+            default_width['glyphWidth'],
+            default_width['charWidth'],
+            font_info['encoding'],
+            0, # TBD: TGLP position
+            0, # TBD: CWDH position
+            0, # TBD: CMAP position
+        )
         file_.write(data)
         position += FINF_HEADER_SIZE
 
@@ -395,44 +427,72 @@ class Bffnt:
         file_.seek(position)
 
         tglp_start_pos = position
-        data = struct.pack(TGLP_HEADER_STRUCT % self.order, TGLP_HEADER_MAGIC, 0, tglp['glyph']['width'],
-                       tglp['glyph']['height'], tglp['sheetCount'], tglp['maxCharWidth'], tglp_data_size,
-                       tglp['glyph']['baseline'], sheet['format'], sheet['cols'], sheet['rows'], sheet['width'],
-                       sheet['height'], TGLP_DATA_OFFSET)
+        data = struct.pack(
+            TGLP_HEADER_STRUCT % self.order,
+            TGLP_HEADER_MAGIC,
+            0,
+            tglp['glyph']['width'],
+            tglp['glyph']['height'],
+            tglp['sheetCount'],
+            tglp['maxCharWidth'],
+            tglp_data_size,
+            tglp['glyph']['baseline'],
+            sheet['format'],
+            sheet['cols'],
+            sheet['rows'],
+            sheet['width'],
+            sheet['height'],
+            self.TGLP_DATA_OFFSET
+        )
         file_.write(data)
 
-        file_.seek(TGLP_DATA_OFFSET)
-        position = TGLP_DATA_OFFSET
+        file_.seek(self.TGLP_DATA_OFFSET)
+        position = self.TGLP_DATA_OFFSET
 
         section_count += 1
 
         for idx in range(tglp['sheetCount']):
-            sheet_filename = '%s_sheet%d.png' % (basename_, idx)
-            sheet_file_ = open(sheet_filename, 'rb')
+            if self.raw_png:
+                sheet_filename = '%s_sheet%d.raw' % (basename_, idx)
+                sheet_file_ = open(sheet_filename, 'rb')
 
-            reader = png.Reader(file=sheet_file_)
-            width, height, pixels, metadata = reader.read()
+                data = sheet_file_.read()
 
-            if width != sheet['width'] or height != sheet['height']:
-                print('Invalid sheet PNG:\nexpected an image size of %dx%d but %s is %dx%d' %
-                      (sheet['width'], sheet['height'], sheet_filename, width, height))
-                self.invalid = True
-                return
+                tglp_data_size = len(data)
+                self.tglp['sheet']['size'] = tglp_data_size
+            else:
+                sheet_filename = '%s_sheet%d.png' % (basename_, idx)
+                sheet_file_ = open(sheet_filename, 'rb')
 
-            if metadata['bitdepth'] != 8 or metadata['alpha'] != True:
-                print('Invalid sheet PNG:\nexpected a PNG8 with alpha')
+                reader = png.Reader(file=sheet_file_)
+                width, height, pixels, metadata = reader.read()
 
-            self.tglp['sheet']['size'] = tglp_data_size
+                if width != sheet['width'] or height != sheet['height']:
+                    print('Invalid sheet PNG:\nexpected an image size of %dx%d but %s is %dx%d' %
+                          (sheet['width'], sheet['height'], sheet_filename, width, height))
+                    self.invalid = True
+                    return
 
-            bmp = []
-            for row in list(pixels):
-                for pixel in range(len(row) // 4):
-                    bmp.append(row[pixel * 4:pixel * 4 + 4])
-            data = self._sheet_to_bitmap(bmp, to_tglp=True)
+                if metadata['bitdepth'] != 8 or metadata['alpha'] != True:
+                    print('Invalid sheet PNG:\nexpected a PNG8 with alpha')
+
+                self.tglp['sheet']['size'] = tglp_data_size
+
+                bmp = []
+                for row in list(pixels):
+                    for pixel in range(len(row) // 4):
+                        bmp.append(row[pixel * 4:pixel * 4 + 4])
+                data = self._sheet_to_bitmap(bmp, to_tglp=True)
+
             file_.write(data)
+
             position += len(data)
 
             sheet_file_.close()
+
+        if self.raw_png:
+            file_.seek(tglp_start_pos + 12)
+            file_.write(struct.pack('%sI' % self.order, tglp_data_size))
 
         file_.seek(tglp_size_pos)
         file_.write(struct.pack('%sI' % self.order, position - tglp_start_pos))
@@ -486,16 +546,34 @@ class Bffnt:
                 file_.seek(position)
 
             size_pos = position + 0x04
-            prev_cmap_offset_pos = position + 0x10
+            prev_cmap_offset_pos = position + (self.CMAP_HEADER_SIZE - 4)
 
             start_pos = position
-            data = struct.pack(CMAP_HEADER_STRUCT % self.order, CMAP_HEADER_MAGIC, 0, cmap['start'], cmap['end'],
-                               cmap['type'], 0, 0)
-            file_.write(data)
-            position += CMAP_HEADER_SIZE
 
-            file_.write(struct.pack('%sH' % self.order, len(cmap['entries'])))
-            position += 2
+            if self.CMAP_HEADER_SIZE == 0x18:
+                data = struct.pack(
+                    self.CMAP_HEADER_STRUCT % self.order,
+                    CMAP_HEADER_MAGIC,
+                    0, # TBD: size
+                    cmap['start'],
+                    cmap['end'],
+                    cmap['type'],
+                    0, # TBD: address of next CMAP section
+                )
+            else:
+                data = struct.pack(
+                    self.CMAP_HEADER_STRUCT % self.order,
+                    CMAP_HEADER_MAGIC,
+                    0, # TBD: size
+                    cmap['start'],
+                    cmap['end'],
+-                   cmap['type'],
+                    0, # padding
+                    0, # size of mapping data
+                )
+
+            file_.write(data)
+            position += self.CMAP_HEADER_SIZE
 
             if cmap['type'] == MAPPING_DIRECT:
                 file_.write(struct.pack('%sH' % self.order, cmap['indexOffset']))
@@ -505,25 +583,47 @@ class Bffnt:
                     file_.write(struct.pack('%sH' % self.order, index))
                     position += 2
             elif cmap['type'] == MAPPING_SCAN:
+                # count
+                if self.int_size == 2:
+                    file_.write(struct.pack('%sH' % self.order, len(cmap['entries'])))
+                else:
+                    file_.write(struct.pack('%sI' % self.order, len(cmap['entries'])))
+                position += self.int_size
+
                 keys = list(cmap['entries'].keys())
                 keys.sort()
                 for code in keys:
                     index = cmap['entries'][code]
-                    file_.write(struct.pack('%s2H' % self.order, ord(code), index))
-                    position += 4
+                    if self.int_size == 2:
+                        file_.write(struct.pack('%s2H' % self.order, ord(code), index))
+                    else:
+                        file_.write(struct.pack('%s2I' % self.order, ord(code), index))
+                    position += self.int_size * 2
 
+            # size of this CMAP
             file_.seek(size_pos)
             file_.write(struct.pack('%sI' % self.order, position - start_pos))
+
             file_.seek(position)
 
-        # fill in size/offset placeholders
+        # total file size
         file_.seek(file_size_pos)
         file_.write(struct.pack('%sI' % self.order, position))
 
+        # amount of sections
         file_.seek(section_count_pos)
         file_.write(struct.pack('%sI' % self.order, section_count))
         if self.verbose:
             print('Done!')
+
+    def _adjust_version(self):
+        if self.version == 0x04010000:
+            self.CMAP_HEADER_SIZE = CMAP2_HEADER_SIZE
+            self.CMAP_HEADER_STRUCT = CMAP2_HEADER_STRUCT
+            self.TGLP_DATA_OFFSET = TGLP2_DATA_OFFSET
+            self.raw_png = True
+            self.int_size = 4
+            self.off_by_one = 1
 
     def _parse_header(self, data):
         bom = struct.unpack_from('>H', data, 4)[0]
@@ -547,7 +647,7 @@ class Bffnt:
 
 
         if self.version not in VERSIONS:
-            print('Unknown version: 0x%08x (expected 0x%08x)' % (version, VERSION))
+            print('Unknown version: 0x%08x (expected 0x%08x, 0x%08x or 0x%08x)' % (self.version, VERSIONS[0], VERSIONS[1], VERSIONS[2]))
             self.invalid = True
             return
 
@@ -673,14 +773,18 @@ class Bffnt:
         format_ = self.tglp['sheet']['format']
         for i in range(self.tglp['sheetCount']):
             sheet = data[position:position + self.tglp['sheet']['size']]
-            if format_ == FORMAT_ETC1 or format_ == FORMAT_ETC1A4:
-                bmp_data = self._decompress_etc1(sheet)
+            if self.raw_png:
+                bmp_data = sheet
             else:
-                bmp_data = self._sheet_to_bitmap(sheet)
+                if format_ == FORMAT_ETC1 or format_ == FORMAT_ETC1A4:
+                    bmp_data = self._decompress_etc1(sheet)
+                else:
+                    bmp_data = self._sheet_to_bitmap(sheet)
+
             self.tglp['sheets'].append({
                 'width': self.tglp['sheet']['width'],
                 'height': self.tglp['sheet']['height'],
-                'data': bmp_data
+                'data': bmp_data,
             })
             position = position + self.tglp['sheet']['size']
 
@@ -1082,7 +1186,7 @@ class Bffnt:
         return next_cwdh_offset
 
     def _parse_cwdh_data(self, info, data):
-        count = info['end'] - info['start'] + 1
+        count = info['end'] - info['start'] + 1 - self.off_by_one
         output = []
         position = 0
         for i in range(count):
@@ -1096,8 +1200,13 @@ class Bffnt:
         info['data'] = output
 
     def _parse_cmap_header(self, data):
-        magic, section_size, code_begin, code_end, map_method, unknown, next_cmap_offset \
-            = struct.unpack(CMAP_HEADER_STRUCT % self.order, data)
+        if self.CMAP_HEADER_SIZE == 0x18:
+            magic, section_size, code_begin, code_end, map_method, next_cmap_offset \
+                = struct.unpack(self.CMAP_HEADER_STRUCT % self.order, data)
+            unknown = 0
+        else:
+            magic, section_size, code_begin, code_end, map_method, unknown, next_cmap_offset \
+                = struct.unpack(self.CMAP_HEADER_STRUCT % self.order, data)
 
         if magic != CMAP_HEADER_MAGIC:
             print('Invalid CMAP magic bytes: %s (expected %s)' % (magic, CMAP_HEADER_MAGIC))
@@ -1106,7 +1215,7 @@ class Bffnt:
             'size': section_size,
             'start': code_begin,
             'end': code_end,
-            'type': map_method
+            'type': map_method,
         })
 
         if self.debug:
@@ -1117,7 +1226,7 @@ class Bffnt:
             print('CMAP Mapping Method: 0x%x (%s)' % (map_method, MAPPING_METHODS[map_method]))
             print('CMAP Next CMAP Offset: 0x%x' % next_cmap_offset)
 
-            print('\nCMAP Unknown: 0x%x\n' % unknown)
+            print('CMAP Unknown: 0x%x\n' % unknown)
 
         return next_cmap_offset
 
@@ -1129,7 +1238,7 @@ class Bffnt:
             info['indexOffset'] = struct.unpack('%sH' % self.order, data[:2])[0]
 
         elif type_ == MAPPING_TABLE:
-            count = info['end'] - info['start'] + 1
+            count = info['end'] - info['start'] + 1 - self.off_by_one * 2
             position = 0
             output = []
             for i in range(count):
@@ -1140,12 +1249,22 @@ class Bffnt:
 
         elif type_ == MAPPING_SCAN:
             position = 0
-            count = struct.unpack('%sH' % self.order, data[position:position + 2])[0]
-            position += 2
+
+            # count
+            if self.int_size == 2:
+                count = struct.unpack('%sH' % self.order, data[position:position + self.int_size])[0]
+            else:
+                count = struct.unpack('%sI' % self.order, data[position:position + self.int_size])[0]
+            position += self.int_size
+
             output = {}
             for i in range(count):
-                code, offset = struct.unpack('%s2H' % self.order, data[position:position + 4])
-                position += 4
+                if self.int_size == 2:
+                    code, offset = struct.unpack('%s2H' % self.order, data[position:position + self.int_size * 2])
+                else:
+                    code, offset = struct.unpack('%s2I' % self.order, data[position:position + self.int_size * 2])
+                position += self.int_size * 2
+
                 try:  #Python2
                     output[unichr(code)] = offset
                 except:  #Python3
